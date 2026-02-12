@@ -1,0 +1,146 @@
+name: Terraform Destroy
+
+on:
+workflow_dispatch:
+    inputs:
+    confirm_destroy:
+        description: 'Type "DESTROY" to confirm resource destruction'
+        required: true
+        default: ''
+    repository_name:
+        description: 'Repository name for safety check'
+        required: true
+        default: ''
+
+permissions:
+contents: write
+actions: read
+
+jobs:
+terraform-destroy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+    uses: actions/checkout@v4
+
+    - name: Setup Terraform
+    uses: hashicorp/setup-terraform@v3
+    with:
+        terraform_version: 1.5.0
+
+    - name: Safety Check - Confirm Destroy
+    run: |
+        if [ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]; then
+        echo "❌ ERROR: You must type 'DESTROY' to confirm resource destruction"
+        echo "This is a safety measure to prevent accidental resource deletion"
+        exit 1
+        fi
+        echo "✅ Destroy confirmation received"
+
+    - name: Safety Check - Repository Name
+    run: |
+        EXPECTED_REPO="${{ github.repository }}"
+        PROVIDED_REPO="${{ github.event.inputs.repository_name }}"
+
+        if [ "$PROVIDED_REPO" != "$EXPECTED_REPO" ]; then
+        echo "❌ ERROR: Repository name mismatch"
+        echo "Expected: $EXPECTED_REPO"
+        echo "Provided: $PROVIDED_REPO"
+        echo "This safety check prevents destroying resources from wrong repository"
+        exit 1
+        fi
+        echo "✅ Repository name verified: $EXPECTED_REPO"
+
+    - name: Safety Check - Verify State File Exists
+    run: |
+        if [ ! -f "terraform.tfstate" ]; then
+        echo "❌ ERROR: No terraform.tfstate file found in this repository"
+        echo "This means no resources were deployed from this repository"
+        echo "Nothing to destroy - exiting safely"
+        exit 1
+        fi
+        echo "✅ State file found - proceeding with destroy"
+
+    - name: Configure AWS credentials
+    uses: aws-actions/configure-aws-credentials@v4
+    with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+    - name: Cache Terraform providers
+    uses: actions/cache@v4
+    with:
+        path: .terraform
+        key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+        restore-keys: |
+        ${{ runner.os }}-terraform-
+
+    - name: Terraform Init
+    run: terraform init
+
+    - name: Show Resources to be Destroyed
+    run: |
+        echo "::group::Resources that will be DESTROYED"
+        terraform show terraform.tfstate
+        echo "::endgroup::"
+
+        echo "::group::Destroy Plan"
+        terraform plan -destroy -no-color
+        echo "::endgroup::"
+
+    - name: Terraform Destroy
+    run: |
+        echo "🚨 DESTROYING RESOURCES - This action cannot be undone!"
+        terraform destroy -auto-approve -no-color
+
+    - name: Verify Destruction
+    run: |
+        if [ -f "terraform.tfstate" ]; then
+        RESOURCE_COUNT=$(terraform show -json terraform.tfstate | jq '.values.root_module.resources | length' 2>/dev/null || echo "0")
+        if [ "$RESOURCE_COUNT" -gt 0 ]; then
+            echo "⚠️ WARNING: Some resources may still exist"
+            terraform show terraform.tfstate
+        else
+            echo "✅ All resources successfully destroyed"
+        fi
+        fi
+
+    - name: Commit Updated State After Destroy
+    run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+
+        # Configure git to use the GitHub token
+        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+
+        # Add updated state file (should be empty or minimal after destroy)
+        if ls terraform.tfstate* 1> /dev/null 2>&1; then
+        git add -f terraform.tfstate*
+        fi
+
+        # Add lock file
+        if [ -f ".terraform.lock.hcl" ]; then
+        git add -f .terraform.lock.hcl
+        fi
+
+        # Check if there are changes to commit
+        if git diff --staged --quiet; then
+        echo "No changes to commit"
+        else
+        git commit -m "Update Terraform state after destroy [skip ci]"
+        git push origin HEAD:${{ github.ref_name }}
+        fi
+    env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload Destroy Logs
+    uses: actions/upload-artifact@v4
+    with:
+        name: terraform-destroy-logs
+        path: |
+        terraform.tfstate
+        .terraform.lock.hcl
+        retention-days: 90
+    if: always()
