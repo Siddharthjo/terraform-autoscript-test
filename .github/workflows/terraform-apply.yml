@@ -1,0 +1,100 @@
+name: Terraform Apply
+
+on:
+workflow_dispatch:
+
+permissions:
+contents: write
+actions: read
+
+jobs:
+terraform-apply:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+    uses: actions/checkout@v4
+
+    - name: Setup Terraform
+    uses: hashicorp/setup-terraform@v3
+    with:
+        terraform_version: 1.5.0
+        terraform_wrapper: false
+
+    - name: Configure AWS credentials
+    uses: aws-actions/configure-aws-credentials@v4
+    with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+    - name: Cache Terraform providers
+    uses: actions/cache@v4
+    with:
+        path: .terraform
+        key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+        restore-keys: |
+        ${{ runner.os }}-terraform-
+
+    - name: Terraform Init
+    run: terraform init
+
+    - name: Download Plan File (if available)
+    uses: actions/download-artifact@v4
+    with:
+        name: terraform-plan-file
+        path: .
+    continue-on-error: true
+
+    - name: Terraform Apply
+    run: |
+        if [ -f "tfplan" ]; then
+        echo "Applying from plan file..."
+        terraform apply -auto-approve tfplan
+        else
+        echo "No plan file found, running direct apply..."
+        terraform apply -auto-approve
+        fi
+
+    - name: Commit Terraform State After Apply
+    run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+
+        # Configure git to use the GitHub token
+        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+
+        # Add only the lock file (not the large provider binaries)
+        if [ -f ".terraform.lock.hcl" ]; then
+        git add -f .terraform.lock.hcl
+        fi
+
+        # Add state files (these should exist after apply)
+        if ls terraform.tfstate* 1> /dev/null 2>&1; then
+        git add -f terraform.tfstate*
+        fi
+
+        # Remove plan file after apply
+        if [ -f "tfplan" ]; then
+        git rm -f tfplan || true
+        fi
+
+        # Check if there are changes to commit
+        if git diff --staged --quiet; then
+        echo "No changes to commit"
+        else
+        git commit -m "Update Terraform state after apply [skip ci]"
+        git push origin HEAD:${{ github.ref_name }}
+        fi
+    env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload Apply Logs
+    uses: actions/upload-artifact@v4
+    with:
+        name: terraform-apply-logs
+        path: |
+        terraform.tfstate
+        .terraform.lock.hcl
+        retention-days: 90
+    if: always()
